@@ -413,6 +413,9 @@ def compile_fx_inner(
     user_visible_outputs: Optional[Dict[str, None]] = None,
     layout_opt: Optional[bool] = None,
     extern_node_serializer: Optional[Callable[[List[ExternKernelNode]], Any]] = None,
+    ##################################### added by me #######################################################
+    torch_ir_gm: Optional[torch.fx.GraphModule] = None,
+    #########################################################################################################
 ) -> Union[CompiledFxGraph, str]:
     """
     Inductor API that compiles a single graph.
@@ -475,7 +478,10 @@ def compile_fx_inner(
         )
     else:
         compiled_graph = fx_codegen_and_compile(
-            gm, example_inputs, **graph_kwargs  # type: ignore[arg-type]
+            gm, example_inputs, **graph_kwargs,  # type: ignore[arg-type]
+            ############################################# added by me #############################################
+            torch_ir_gm=torch_ir_gm,
+            #######################################################################################################
         )
 
     log.debug("FX codegen and compilation took %.3fs", time.time() - start)
@@ -620,6 +626,9 @@ def fx_codegen_and_compile(
     user_visible_outputs: Optional[Dict[str, None]] = None,
     layout_opt: Optional[bool] = None,
     extern_node_serializer: Optional[Callable[[List[ExternKernelNode]], Any]] = None,
+    ##################################### added by me #######################################################
+    torch_ir_gm: Optional[torch.fx.GraphModule] = None,
+    #########################################################################################################
 ) -> Union[CompiledFxGraph, str]:
     if is_tf32_warning_applicable(gm):
         _warn_tf32_disabled()
@@ -675,6 +684,9 @@ def fx_codegen_and_compile(
         _recursive_post_grad_passes(gm, is_inference=is_inference)
         V.debug.fx_graph_transformed(gm, example_inputs)
         post_grad_graphs_log.debug("%s", lazy_format_graph_code("AFTER POST GRAD", gm))
+        # post_grad_graphs_log.debug("%s", gm.graph.print_tabular())
+        # from torch.fx.passes.graph_drawer import FxGraphDrawer
+        # FxGraphDrawer(gm, "post_grad_graph").get_dot_graph().write_pdf("/home/abhishek/post_grad_graph.pdf")
         trace_structured(
             "inductor_post_grad_graph",
             payload_fn=lambda: gm.print_readable(print_output=False),
@@ -785,7 +797,10 @@ def fx_codegen_and_compile(
                 )
 
                 V.graph.disable_cudagraphs_reason = check_lowering_disable_cudagraph(
-                    V.graph.device_node_mapping
+                    V.graph.device_node_mapping,
+                    ################################################added by me #####################################
+                    torch_ir_gm = torch_ir_gm,
+                    #################################################################################################
                 )
 
             compiled_graph = CompiledFxGraph(
@@ -1326,6 +1341,9 @@ def compile_fx(
             is_inference=is_inference,
             boxed_forward_device_index=forward_device,
             user_visible_outputs=user_visible_outputs,
+            #############################################added by me #######################################
+            torch_ir_gm = model_,
+            ################################################################################################
         )
 
     fw_compiler = functools.partial(fw_compiler_base, is_inference=False)
@@ -1371,6 +1389,9 @@ def compile_fx(
             graph_id=graph_id,
             boxed_forward_device_index=forward_device,
             user_visible_outputs=user_visible_outputs,
+            #############################################added by me #######################################
+            torch_ir_gm = model_,
+            ################################################################################################
         )
 
     # TODO: can add logging before/after the call to create_aot_dispatcher_function
@@ -1413,7 +1434,7 @@ def compile_fx(
     with V.set_fake_mode(fake_mode), torch._guards.tracing(
         tracing_context
     ), compiled_autograd.disable(), functorch_config.patch(unlift_effect_tokens=True):
-        return aot_autograd(
+        aot_autograd_return = aot_autograd(
             fw_compiler=fw_compiler,
             bw_compiler=bw_compiler,
             inference_compiler=inference_compiler,
@@ -1422,6 +1443,183 @@ def compile_fx(
             keep_inference_input_mutations=True,
         )(model_, example_inputs_)
 
+    # # ######################################### added by me ###################################
+    # # if 'cell_anchors' in name:
+    # #     for idx, submod in enumerate(subobj):
+    # #         if isinstance(submod, torch.Tensor):
+    # #             subobj[idx] = submod.to('cuda')
+    # # base_dict[name] = subobj
+    # # #########################################################################################
+    # base = V.original_module
+    # base_dict = object.__getattribute__(base, "__dict__")
+    # name = 'cell_anchors'
+    # if name in base_dict:
+    #     subobj = base_dict[name]
+    #     for idx, submod in enumerate(subobj):
+    #         if isinstance(submod, torch.Tensor):
+    #             subobj[idx] = submod.to('cuda')
+    #     base_dict[name] = subobj
+
+    #     # if V does not have attribute "restarted" then do the restart and set the attribute
+
+    #     if not hasattr(V, "restarted"):
+    #         V.restarted = True
+    #         from torch._dynamo.exc import RestartAnalysis
+    #         raise RestartAnalysis
+
+    # print(f"{V.original_module = }")
+    # return aot_autograd_return
+
+    # print(f"{V.corresponding_torch_ir_gm_root_sources=}")
+    # print(f"{V.root_sources=}")
+    is_corresponding_torch_ir_gm_root_sources_none = not V.corresponding_torch_ir_gm_root_sources
+    is_root_sources_none = not V.root_sources
+
+    # print(f"{is_corresponding_torch_ir_gm_root_sources_none=}, {is_root_sources_none=}")
+
+    if is_corresponding_torch_ir_gm_root_sources_none and is_root_sources_none:
+        return aot_autograd_return
+    
+    
+    # We have hit a CPU device. We need to modify the Torch IR nodes and then call compile_fx again
+    for node in V.corresponding_torch_ir_gm_root_sources:
+        new_kwargs = dict(node.kwargs)  # Create a copy of kwargs
+        new_kwargs['device'] = 'cuda'  # Modify the copy
+        node.kwargs = new_kwargs  # Assign the copy back to the node
+
+    V.corresponding_torch_ir_gm_root_sources = None
+    # Note: There are cases where torch_ir_gm_root_sources is not None and root_sources is not None.
+    # That happens when the offending inductor IR nodes are placeholder nodes as well as non-placeholder nodes.
+    # In such case, we first deal with the non placeholder nodes, possibly call compile_fx() again, and 
+    # then deal with the placeholder nodes in the next iteration
+    # in the next iteration, the root_sources will be non None, and the corresponding_torch_ir_gm_root_sources will be None
+    # and we will not enter this if condition.
+    if is_corresponding_torch_ir_gm_root_sources_none and not is_root_sources_none:
+        # print("Entering the if condition") 
+        # situation when we have offending inductor IR nodes as placeholder nodes
+        all_offending_inductor_ir_nodes_is_placeholder = all( node.op == "placeholder" for node in V.root_sources)
+        assert all_offending_inductor_ir_nodes_is_placeholder # need to check if this logic is correct or not
+        model_params = {**dict(model_.named_parameters()), **dict(model_.named_buffers())}
+        len_model_params = len(model_params)
+        # print(f"{model_params=}, {len(model_params)=}")
+
+        # iterate the placeholder nodes in V.root_sources. The nodes are of the form arg0_1, arg1_1, arg2_1, ...
+        # get the argument index from the node names.
+        inductor_ir_placeholder_indicies = []
+        for node in V.root_sources:
+            inductor_ir_placeholder_indicies.append(int(node.name.split('_')[0].split('arg')[1]))
+
+        any_inductor_arg_is_model_param = any( index< len_model_params for index in inductor_ir_placeholder_indicies)
+        any_inductor_arg_is_not_model_param = any( index>= len_model_params for index in inductor_ir_placeholder_indicies)
+
+        # print(f"{inductor_ir_placeholder_indicies=}, {any_inductor_arg_is_model_param=}, {any_inductor_arg_is_not_model_param=}")
+        # iterate through the model_params, and check if it is a tensor, and if so, check if on CPU or not.
+        # if on CPU, push it to the GPU.
+        if any_inductor_arg_is_model_param:
+            for name, param in model_params.items():
+                if param.device.type == 'cpu':
+                    param.data = param.data.to('cuda')
+        
+        if any_inductor_arg_is_not_model_param: # situation of inlining. We need to make changes in the byte code.
+            # print("situation of inlining. We need to make changes in the byte code.")
+
+            # changing the byte code rewriter by making modifications in the corresponding source classes
+            from torch._dynamo.source import NumpyTensorSource, GetItemSource
+            # setattr(NumpyTensorSource, 'reconstruct', NumpyTensorSource.new_reconstruct) ################## <--- do this 
+            #                                                                              ##################  conditionally based on 
+            #                                                                              #################   whether the original 
+            #                                                                              ##################  nn_module has
+            # setattr(GetItemSource, 'reconstruct', GetItemSource.new_reconstruct)
+
+            # for i in range(len(example_inputs_)):
+            #     if isinstance(example_inputs_[i], torch.Tensor):
+            #         example_inputs_[i] = example_inputs_[i].to('cuda')
+
+
+            # we reset dynamo. This is experimental/ smoke test. If this passes, we need to make sure of two thing
+            # this reset is very costly, and try to pin point and reset only what is absolutely required.
+            # how to deal with the example inputs.
+            # torch._dynamo.reset()
+
+
+            # get the names of the nodes corresponding placeholder nodes in the Torch IR
+            placeholder_torch_ir_nodes = [node for node in model_.graph.nodes if node.op == "placeholder"]
+            offending_node_names = [node.name for node in placeholder_torch_ir_nodes]
+
+            bases = V.original_module
+            base_dicts = [object.__getattribute__(base, "__dict__") for base in bases]
+            #print(f"{base=}, {base_dict=}")
+            
+            # name = 'cell_anchors'
+            # traverse through the (attribute) names in the base_dict and add it to the list of offending_attribute_names if
+            # that attribute name forms a substring in any of the offending_node_names
+            offending_attribute_names = [name for base_dict in base_dicts for name in base_dict if any(name in offending_node_name for offending_node_name in offending_node_names)]
+            offending_attribute_names = list(set(offending_attribute_names))
+            # print(f"{offending_node_names=}")
+            # print(f"{offending_attribute_names=}")
+            
+            requires_dynamo_restart_analysis = False
+            # Case requiring Dynamo Analysis Restart
+            for name in offending_attribute_names:
+                for base_dict in base_dicts:
+                    if name in base_dict:
+                        subobj = base_dict[name]
+                        # print(f"{name=}, {hex(id(subobj))=}, {subobj=}")
+                        # check if subobj is a list of tensors
+                        if isinstance(subobj, list) and all(isinstance(submod, torch.Tensor) for submod in subobj):
+                            for idx, submod in enumerate(subobj):
+                                if isinstance(submod, torch.Tensor):
+                                    subobj[idx] = submod.to('cuda')
+                                    requires_dynamo_restart_analysis = True
+                            if requires_dynamo_restart_analysis: # not unnecessarily doing reassignment
+                                                                 # if the subobj didn't even change.
+                                base_dict[name] = subobj
+                        elif isinstance(subobj, torch.Tensor):
+                            base_dict[name] = subobj.to('cuda')
+                            requires_dynamo_restart_analysis = True
+                            
+            if requires_dynamo_restart_analysis:
+                V.root_sources = None
+                # print("2. Restarting Dynamo Analysis")
+                from torch._dynamo.exc import RestartAnalysis
+                raise RestartAnalysis
+            # Case not requiring Dynamo Analysis Restart
+            import numpy as np
+            for name in offending_attribute_names:
+                for base_dict in base_dicts:
+                    if name in base_dict:
+                        subobj = base_dict[name]
+                        # print(f"{name=}, {subobj=}")                            
+                        # in the else case check if the object is a numpy object or not
+                        if isinstance(subobj, (np.generic, np.ndarray, np.float64)):
+                            setattr(NumpyTensorSource, 'reconstruct', NumpyTensorSource.new_reconstruct)
+                            for i in range(len(example_inputs_)):
+                                if isinstance(example_inputs_[i], torch.Tensor):
+                                    example_inputs_[i] = example_inputs_[i].to('cuda')
+
+            # return aot_autograd_return
+
+
+    V.root_sources = None
+
+    # print("Calling compile_fx again")
+    return compile_fx(
+        model_,
+        example_inputs_,
+        inner_compile,
+        config_patches,
+        decompositions,
+    )
+
+    # graph = model_.graph
+    # for node in graph.nodes:
+    #     if  'arange' in node.name: # this should have to be dealt with in a better manner
+    #                              # because sizes is the name of the variable and it might change in a different program
+    #         print(f"{type(node.args)=}, {node.args=}, {type(node.kwargs)=}, {node.kwargs=}")
+    #         new_kwargs = dict(node.kwargs)  # Create a copy of kwargs
+    #         new_kwargs['device'] = 'cuda'  # Modify the copy
+    #         node.kwargs = new_kwargs  # Assign the copy back to the node
+    #     # print(f"{node.op=}, {node.name=}, {node.target=}, {node.meta=}")
 
 def _shape_env_from_inputs(inputs: List[torch.Tensor]):
     shape_env = None

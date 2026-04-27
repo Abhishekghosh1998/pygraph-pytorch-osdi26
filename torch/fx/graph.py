@@ -1462,11 +1462,18 @@ class Graph:
                   "which could not be found on this machine. Run `pip "
                   "install tabulate` to install the library.")
             raise
+        meta_exits = any(node.meta for node in self.nodes)
+        if not meta_exits:
+            node_specs = [[n.op, n.name, n.target, n.args, n.kwargs]
+                        for n in self.nodes]
+            print(tabulate(node_specs,
+                headers=['opcode', 'name', 'target', 'args', 'kwargs']))
+        else:
+            node_specs = [[n.op, n.name, n.target, n.args, n.kwargs, n.meta]
+                        for n in self.nodes]
+            print(tabulate(node_specs,
+                headers=['opcode', 'name', 'target', 'args', 'kwargs', 'meta']))
 
-        node_specs = [[n.op, n.name, n.target, n.args, n.kwargs]
-                      for n in self.nodes]
-        print(tabulate(node_specs,
-              headers=['opcode', 'name', 'target', 'args', 'kwargs']))
 
     @compatibility(is_backward_compatible=True)
     def lint(self):

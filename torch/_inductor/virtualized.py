@@ -306,6 +306,12 @@ class _V:
     set_current_node: Callable[[Any], Any] = _current_node._set_handler
     get_current_node: Callable[[], Any] = _current_node._get_handler
 
+    ################################added by me#############################
+    corresponding_torch_ir_gm_root_sources = None
+    root_sources = None
+    original_module = None
+    #######################################################################
+
     @property
     def ops(self) -> OpsHandler[Any]:
         """The operator handler specific to the current codegen task"""
