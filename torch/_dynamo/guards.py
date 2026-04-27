@@ -209,9 +209,18 @@ class GuardManager:
         return self.root.check_verbose(x)
 
 
+##########################################added by me ################################################
+#  Currently converting to a GPU tensor from a numpy nd array.
+# Don't know how, but if there is a numpy attribute in the original nn module, 
+# then the output graphmodule to changed to take this attribute as an input.
+# Very strange.
+#######################################################################################################
 def from_numpy(a):
     # If not numpy array, piggy back on e.g. tensor guards to check type
-    return torch.as_tensor(a) if isinstance(a, (np.generic, np.ndarray)) else a
+    return torch.as_tensor(a) if isinstance(a, (np.generic, np.ndarray)) else a # <--------- original
+    # x = torch.tensor(a, device='cuda') if isinstance(a, (np.generic, np.ndarray, np.float64)) else a
+    # # print(f"|||||||||||||||||||||||||||||||||||||||||||||||from_numpy: {x=}, {type(x)=}, {hex(id(x))=}, {x.device=}, {type(a)}|||||||||||||||||||||||||||||||||||||||||||||||")
+    # return x
 
 
 # For user stack printing

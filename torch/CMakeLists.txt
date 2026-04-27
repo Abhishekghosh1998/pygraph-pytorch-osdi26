@@ -84,6 +84,11 @@ set(TORCH_PYTHON_LINK_LIBRARIES
     fmt::fmt-header-only
     ATEN_CPU_FILES_GEN_LIB)
 
+if(USE_CUDA)
+  # Prefer the imported interface target created in cuda.cmake
+  list(APPEND TORCH_PYTHON_LINK_LIBRARIES caffe2::nvrtc)
+endif()
+
 if(USE_ASAN AND TARGET Sanitizer::address)
   list(APPEND TORCH_PYTHON_LINK_LIBRARIES Sanitizer::address)
 endif()
@@ -333,7 +338,7 @@ endif()
 # Preserve CUDA_GENCODE flags
 if(USE_CUDA)
   torch_cuda_get_nvcc_gencode_flag(_ARCH_FLAGS)
-  set_source_files_properties(${TORCH_SRC_DIR}/csrc/cuda/Module.cpp PROPERTIES COMPILE_FLAGS "-DCUDA_ARCH_FLAGS=\"${_ARCH_FLAGS_readable}\"")
+  set_source_files_properties(${TORCH_SRC_DIR}/csrc/cuda/Module.cpp PROPERTIES COMPILE_FLAGS "-DCUDA_ARCH_FLAGS=\"${_ARCH_FLAGS_readable}\" -mavx2 -mfma")
 endif()
 
 # Preserve HIP arch flags
@@ -343,6 +348,10 @@ if(USE_ROCM)
 endif()
 
 target_compile_definitions(torch_python PRIVATE "-DTHP_BUILD_MAIN_LIB")
+
+target_compile_definitions(torch_python PRIVATE
+    PYTORCH_CUDA_INCLUDE_DIR="${CUDAToolkit_INCLUDE_DIRS}"
+)
 
 target_link_libraries(torch_python PRIVATE torch_library ${TORCH_PYTHON_LINK_LIBRARIES})
 

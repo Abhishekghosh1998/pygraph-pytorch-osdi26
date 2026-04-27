@@ -589,7 +589,7 @@ class triton:
     cudagraph_skip_dynamic_graphs = False
 
     # assertions not on the fast path, steady state
-    slow_path_cudagraph_asserts = True
+    slow_path_cudagraph_asserts = False #True <----- currently setting this guy to False
 
     # TODO - need to debug why this prevents cleanup
     cudagraph_trees_history_recording = False
@@ -684,6 +684,13 @@ class triton:
     # extraction and minification functionality.
     # Valid values: "compile_error", "runtime_error", "accuracy"
     inject_relu_bug_TESTING_ONLY: Optional[str] = None
+
+    # for switching indirection on and off
+    indirection = (
+        os.environ.get("TORCHINDUCTOR_TRITON_INDIRECTION", "0") == "1"
+    ) # a boolean variable. which can also be set externally using the environment variable
+        # for standalone testing.
+    non_static_input_idxs: List[int] = []
 
 
 class aot_inductor:

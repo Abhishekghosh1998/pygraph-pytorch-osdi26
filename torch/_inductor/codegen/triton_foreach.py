@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from sympy import Integer
+import torch
 
 from .. import metrics
 from ..scheduler import SchedulerNode
@@ -95,6 +96,11 @@ class ForeachKernel(Kernel):
         self.x_block_count = 0
         self.y_block_count = 0
 
+        if torch._inductor.config.triton.indirection:
+            self.indirection_args: list[str] = None
+            self.indirection_args_indices: list[int] = None
+
+
     def get_block_size(self):
         if self.blocking_2d:
             return self.block_size_2d
@@ -161,6 +167,10 @@ class ForeachKernel(Kernel):
             "device_type": V.graph.scheduler.current_device.type,
             "constants": {},
         }
+
+        if torch._inductor.config.triton.indirection:
+            triton_meta["indirection_args_indices"] = self.indirection_args_indices
+        
         triton_meta["configs"] = [config_of(signature)]
         inductor_meta = {
             "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
@@ -188,7 +198,25 @@ class ForeachKernel(Kernel):
         code = IndentedBuffer()
 
         code.splice(gen_common_triton_imports())
-        argdefs, _, _ = self.args.python_argdefs()
+        argdefs, call_args, _ = self.args.python_argdefs()
+        if torch._inductor.config.triton.indirection:
+            non_static_input_idxs = torch._inductor.config.triton.non_static_input_idxs
+            arg_name_to_index = {arg: i for i, arg in enumerate(V.graph.graph_input_names)}
+
+            self.indirection_args_indices = [i for i, arg in enumerate(call_args)              # sometimes even constants are passed directly as arguments
+                                            if isinstance(arg, str)                            # there `startswith` causes trouble.
+                                            and (not arg.startswith("buf")) # in the training phase, the external are not just arg0_1, .. but just anything like primals and all
+                                                                            # but just not buf0, buf1, ...
+                                            and (not arg.startswith("_tensor_constant")) # if the triton kernel uses certain constants,
+                                                                                        # they do not need indirection
+                                            and arg not in V.graph.scheduler.inputs_to_aten_convolution_backward_default 
+                                            # in the training, certain arguments are passed to both triton kernel and 
+                                            # non triton cudnn kernels. In those cases, we need to disable indirection 
+                                            # for those arguments.
+                                            and arg_name_to_index[arg] in non_static_input_idxs
+                                            ]
+                                            
+            self.indirection_args = [call_args[i] for i in self.indirection_args_indices]
         code.splice(self.jit_lines())
         code.writeline(
             f"def {name or str(Placeholder.KERNEL_NAME)}({', '.join(argdefs)}):"

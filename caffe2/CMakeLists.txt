@@ -654,6 +654,9 @@ endif()
 
 if(USE_CUDA)
   list(APPEND Caffe2_GPU_CU_SRCS ${Caffe2_GPU_HIP_JIT_FUSERS_SRCS})
+  list(APPEND Caffe2_GPU_CU_SRCS
+    "${TORCH_SRC_DIR}/csrc/cuda/graph_apply_updates.cu"
+  )
   add_library(caffe2_nvrtc SHARED ${ATen_NVRTC_STUB_SRCS})
   if(MSVC)
     # Delay load nvcuda.dll so we can import torch compiled with cuda on a CPU-only machine

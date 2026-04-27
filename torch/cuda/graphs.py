@@ -1,5 +1,5 @@
 import gc
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from torch.utils import _pytree
@@ -110,6 +110,62 @@ class CUDAGraph(torch._C._CUDAGraph):
         enabled via CUDAGraph.enable_debug_mode()
         """
         return super().debug_dump(debug_path)
+    
+    # ---------------- new APIs (augmentations) ----------------
+
+    def set_defer_instantiate(self, enable: bool) -> None:
+        r"""Opt-in: defer instantiation in :meth:`capture_end`.
+
+        If ``enable=True`` (default is ``False``), then :meth:`capture_end` will
+        *not* instantiate the graph exec and will keep the raw ``cudaGraph_t``
+        alive. This allows you to call :meth:`mark_nodes_and_get_devhandles`
+        before finally calling :meth:`instantiate`.
+
+        Notes:
+            - Must be called **before** capture begins.
+            - Default behavior for capture remains unchanged unless enabled.
+        """
+        return super().set_defer_instantiate(bool(enable))
+
+    def instantiate(self) -> None:
+        r"""Instantiate the graph exec after a deferred :meth:`capture_end`.
+
+        Call this only if :meth:`set_defer_instantiate(True)` was set prior to
+        capture and you’ve already performed any pre-instantiation steps
+        (e.g., marking nodes device-updatable).
+        """
+        return super().instantiate()
+
+    def mark_nodes_and_get_devhandles(self, node_indices: List[int]) -> List[int]:
+        r"""Mark kernel nodes as device-updatable and return device handles.
+
+        Args:
+            node_indices (List[int]): Zero-based indices of kernel nodes within
+                this graph to mark as device-updatable.
+
+        Returns:
+            List[int]: Device handles (``cudaGraphDeviceNode_t``) encoded as
+            unsigned 64-bit integers. Copy these into a device buffer and pass
+            to your apply-updates kernel.
+
+        Preconditions:
+            - Use only after :meth:`capture_end` with
+              :meth:`set_defer_instantiate(True)` (i.e., graph is captured but
+              not instantiated).
+        """
+        return list(super().mark_nodes_and_get_devhandles(node_indices))
+
+    @staticmethod
+    def sizeof_kernel_node_update() -> int:
+        r"""Return ``sizeof(cudaGraphKernelNodeUpdate)`` on this build."""
+        return int(torch._C._CUDAGraph.sizeof_kernel_node_update())
+
+    @staticmethod
+    def sizeof_device_node_handle() -> int:
+        r"""Return ``sizeof(cudaGraphDeviceNode_t)`` on this build."""
+        return int(torch._C._CUDAGraph.sizeof_device_node_handle())
+    
+    
 
 
 class graph:

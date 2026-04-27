@@ -522,6 +522,7 @@ static PyObject* _custom_eval_frame(
     int throw_flag,
     PyObject* callback,
     int* should_clear_frame) {
+// printf("Entering _custom_eval_frame:\n");
 #if IS_PYTHON_3_11_PLUS
   DEBUG_TRACE(
       "begin %s %s %i %i",
@@ -631,6 +632,7 @@ static PyObject* _custom_eval_frame(
     *should_clear_frame = 1;
     return eval_custom_code(tstate, frame, cached_code, throw_flag, free_vars_copied);
   }
+  DEBUG_TRACE(">>> cache miss %s", get_frame_name(frame));
   // cache miss
   CacheEntry* cache_entry = extract_cache_entry(extra);
   FrameState* frame_state = extract_frame_state(extra);
@@ -648,7 +650,6 @@ static PyObject* _custom_eval_frame(
     return NULL;
   } else if (result != Py_None) {
     DEBUG_TRACE("create cache %s", get_frame_name(frame));
-
     // NB: We could use extract_cache_entry to get the cache_entry, but
     // extract_cache_entry returns a borrowed reference. Modifying a borrowed
     // reference seems wrong. Therefore, we directly access the

@@ -53,7 +53,27 @@
 #ifndef WIN32
 #include <pthread.h>
 #endif
+#include <immintrin.h>
 
+////////////////////////////////////////////////////////////////////////////////
+#include <pybind11/stl.h>
+
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+
+#include "graph_apply_updates.cuh"
+
+////////////////////////////////////////////////////////////////////////////////
+#include <cuda.h>
+#include <nvrtc.h>
+#include <c10/cuda/driver_api.h>
+
+#include <atomic>
+#include <mutex>
+#include <fstream>  // for std::ifstream
+
+////////////////////////////////////////////////////////////////////////////////
 using namespace torch;
 
 static bool in_bad_fork = false; // True for children forked after cuda init
@@ -74,6 +94,346 @@ static void poison_fork() {
   static c10::once_flag flag;
   c10::call_once(flag, [] { pthread_atfork(nullptr, nullptr, forked_child); });
 #endif
+}
+
+// Launch the statically-compiled kernel on the given stream.
+// All *_ptr args are device pointers passed as Python ints (tensor.data_ptr()).
+static void _graph_launch_apply_kernel_static(
+    uintptr_t stream_addr,
+    uintptr_t dev_nodes_ptr,   // cudaGraphDeviceNode_t[num_nodes] (stored as uint64 in Python; same size or smaller)
+    uintptr_t starts_ptr,      // int32[num_nodes]
+    uintptr_t counts_ptr,      // int32[num_nodes]
+    uintptr_t offsets_ptr,     // size_t[total_updates]
+    uintptr_t values_in_ptr,   // uint64[total_updates]
+    uintptr_t values_buf_ptr,  // uint64[total_updates]
+    uintptr_t updates_ptr,     // byte slab >= total_updates*sizeof(cudaGraphKernelNodeUpdate)
+    int num_nodes,
+    int total_updates,
+    uintptr_t status_out_ptr   // int32[1]
+) {
+    // Cast raw integers back to device pointers
+    auto dev_nodes  = reinterpret_cast<const cudaGraphDeviceNode_t*>(dev_nodes_ptr);
+    auto starts     = reinterpret_cast<const int*>(starts_ptr);
+    auto counts     = reinterpret_cast<const int*>(counts_ptr);
+    auto offsets    = reinterpret_cast<const size_t*>(offsets_ptr);
+    auto values_in  = reinterpret_cast<const unsigned long long*>(values_in_ptr);
+    auto values_buf = reinterpret_cast<unsigned long long*>(values_buf_ptr);
+    auto updates    = reinterpret_cast<cudaGraphKernelNodeUpdate*>(updates_ptr);
+    auto status_out = reinterpret_cast<int*>(status_out_ptr);
+
+    auto stream = reinterpret_cast<cudaStream_t>(stream_addr);
+
+    // Enqueue <<<1,1>>> so this is capturable inside a CUDA graph
+    launch_apply_param_updates_kernel(
+        stream,
+        dev_nodes, starts, counts, offsets,
+        values_in, values_buf, updates,
+        num_nodes, total_updates, status_out
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+static void init_graph_apply_updates_bindings(py::module& m) {
+    m.def("_graph_launch_apply_kernel_static",
+          &_graph_launch_apply_kernel_static,
+          py::arg("stream_addr"),
+          py::arg("dev_nodes_ptr"),
+          py::arg("starts_ptr"),
+          py::arg("counts_ptr"),
+          py::arg("offsets_ptr"),
+          py::arg("values_in_ptr"),
+          py::arg("values_buf_ptr"),
+          py::arg("updates_ptr"),
+          py::arg("num_nodes"),
+          py::arg("total_updates"),
+          py::arg("status_out_ptr"),
+          py::call_guard<py::gil_scoped_release>());
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Nvrtc dynamic compilation
+////////////////////////////////////////////////////////////////////////////////
+
+// ---------------- error helpers ----------------
+#define NVRTC_CHECK(EXPR) do {                                        \
+  nvrtcResult _r = (EXPR);                                            \
+  TORCH_CHECK(_r == NVRTC_SUCCESS, "NVRTC error(", int(_r), "): ",    \
+              nvrtcGetErrorString(_r));                               \
+} while (0)
+
+#define CUCHK(EXPR) do {                                              \
+  C10_CUDA_DRIVER_CHECK(EXPR);                                        \
+} while (0)
+
+// -------------- tiny kernel cache --------------
+struct NvrtcKernel {
+  CUmodule   mod{nullptr};
+  CUfunction fn{nullptr};
+  std::string arch_flag;  // e.g., "--gpu-architecture=sm_90"
+  std::string name;       // kernel function name
+};
+
+static std::mutex g_mu;
+static std::atomic<int> g_next_id{1};
+static std::unordered_map<std::string, int>         g_key_to_id;
+static std::unordered_map<int, NvrtcKernel>         g_id_to_kernel;
+
+static std::string sm_arch_flag() {
+  int dev = 0;
+  auto r = cudaGetDevice(&dev);
+  TORCH_CHECK(r == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(r));
+  cudaDeviceProp prop{};
+  r = cudaGetDeviceProperties(&prop, dev);
+  TORCH_CHECK(r == cudaSuccess, "cudaGetDeviceProperties failed: ", cudaGetErrorString(r));
+  std::ostringstream oss;
+  oss << "--gpu-architecture=sm_" << prop.major << prop.minor;
+  return oss.str();
+}
+
+static std::string make_key(const std::string& arch,
+                            const std::string& name,
+                            const std::string& src) {
+  const size_t h = std::hash<std::string>{}(src);
+  std::ostringstream oss;
+  oss << arch << "|" << name << "|" << std::hex << h;
+  return oss.str();
+}
+
+// --- public: build kernel (NVRTC → PTX → module) ---
+static int _nvrtc_build_kernel(const std::string& src,
+                               const std::string& kernel_name /*= "apply_param_updates_kernel"*/,
+                               const std::vector<std::string>& extra_opts /*= {}*/) {
+  #if !defined(CUDA_VERSION)
+  TORCH_CHECK(false,
+      "CUDA toolkit not detected at build time (CUDA_VERSION undefined). "
+      "This feature requires CUDA 12.4+.");
+  #elif CUDA_VERSION < 12040
+  TORCH_CHECK(false,
+      "CUDA toolkit too old at build time: CUDA_VERSION=", CUDA_VERSION,
+      " (< 12040). Device-graph updates require CUDA 12.4+.");
+  #endif
+
+  const std::string arch = sm_arch_flag();
+  const std::string key  = make_key(arch, kernel_name, src);
+  const std::string inc_flag = std::string("-I") + PYTORCH_CUDA_INCLUDE_DIR;
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (auto it = g_key_to_id.find(key); it != g_key_to_id.end()) {
+    return it->second; // cached
+  }
+
+  nvrtcProgram prog{};
+  NVRTC_CHECK(nvrtcCreateProgram(&prog, src.c_str(), "nvrtc_apply_kernel.cu", 0, nullptr, nullptr));
+
+  // base options
+  std::vector<const char*> opts;
+  opts.push_back("--std=c++17");
+  opts.push_back(arch.c_str());
+  opts.push_back(inc_flag.c_str());
+  opts.push_back("--relocatable-device-code=true"); // so that cuda_device_runtime_api.h is included
+  // cuda_device_runtime_api.h is needed for apply updates __device__ api
+  
+  // You can uncomment to help debug SASS mapping:
+  // opts.push_back("-lineinfo");
+
+  // pass-through any user extras
+  std::vector<std::string> extras = extra_opts;
+  for (auto& s : extras) opts.push_back(s.c_str());
+
+  nvrtcResult comp = nvrtcCompileProgram(prog, static_cast<int>(opts.size()), opts.data());
+
+  // attach NVRTC build log if any
+  size_t logSize = 0;
+  nvrtcGetProgramLogSize(prog, &logSize);
+  std::string log;
+  if (logSize) {
+    log.resize(logSize);
+    nvrtcGetProgramLog(prog, log.data());
+  }
+  TORCH_CHECK(comp == NVRTC_SUCCESS,
+              "NVRTC compile failed for '", kernel_name, "':\n", log);
+
+  // get PTX
+  size_t ptxSize = 0;
+  NVRTC_CHECK(nvrtcGetPTXSize(prog, &ptxSize));
+  std::string ptx(ptxSize, '\0');
+  NVRTC_CHECK(nvrtcGetPTX(prog, ptx.data()));
+  NVRTC_CHECK(nvrtcDestroyProgram(&prog));
+
+  // load into driver and get function
+  CUmodule mod{};
+  CUfunction fn{};
+  CUCHK(c10::cuda::DriverAPI::get()->cuModuleLoadDataEx_(&mod, ptx.data(), 0, nullptr, nullptr));
+  CUCHK(c10::cuda::DriverAPI::get()->cuModuleGetFunction_(&fn, mod, kernel_name.c_str()));
+  
+  // // --- Driver link: PTX + device runtime -> CUBIN ---
+  // CUlinkState link_state{};
+  // CUjit_option options[2];
+  // void* optionVals[2];
+
+  // // (optional) capture linker log
+  // char infoLog[8192] = {0};
+  // options[0]    = CU_JIT_INFO_LOG_BUFFER;
+  // optionVals[0] = infoLog;
+  // logSize = sizeof(infoLog);
+  // options[1]    = CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES;
+  // optionVals[1] = reinterpret_cast<void*>(static_cast<uintptr_t>(logSize));
+
+  // CUCHK(c10::cuda::DriverAPI::get()->cuLinkCreate_(
+  //     /*numOptions*/2, options, optionVals, &link_state));
+
+  // // Add PTX from NVRTC
+  // CUCHK(c10::cuda::DriverAPI::get()->cuLinkAddData_(
+  //     link_state, CU_JIT_INPUT_PTX,
+  //     (void*)ptx.data(), ptx.size(),
+  //     "nvrtc.ptx", /*numOptions*/0, nullptr, nullptr));
+
+  // // Locate libcudadevrt.a (adjust search order as you like)
+  // std::string cuda_home;
+  // const char* env = std::getenv("CUDA_HOME");
+  // if (!env) env = std::getenv("CUDA_PATH");
+  // if (env) cuda_home = env; else cuda_home = "/usr/local/cuda";
+  // printf("CUDA_HOME=%s\n", cuda_home.c_str());
+  // // Typical paths on Linux; try both lib64 and lib
+  // std::vector<std::string> candidates = {
+  //     cuda_home + "/lib64/libcudadevrt.a",
+  //     cuda_home + "/lib/libcudadevrt.a"
+  // };
+
+  // bool added_devrt = false;
+  // for (const auto& path : candidates) {
+  //   if (std::ifstream(path).good()) {
+  //     CUCHK(c10::cuda::DriverAPI::get()->cuLinkAddFile_(
+  //         link_state, CU_JIT_INPUT_LIBRARY, path.c_str(),
+  //         /*numOptions*/0, nullptr, nullptr));
+  //     added_devrt = true;
+  //     break;
+  //   }
+  // }
+  // TORCH_CHECK(added_devrt,
+  //     "Could not find libcudadevrt.a. Set CUDA_HOME or install the CUDA toolkit.");
+
+  // // Complete link to get a CUBIN blob
+  // void* cubinOut = nullptr;
+  // size_t cubinSize = 0;
+  // CUCHK(c10::cuda::DriverAPI::get()->cuLinkComplete_(link_state, &cubinOut, &cubinSize));
+
+  // // Optionally: print linker info (useful while bringing this up)
+  // // if (infoLog[0]) { TORCH_WARN("cuLink info:\n", infoLog); }
+
+  // // Load module from CUBIN
+  // CUmodule mod{};
+  // CUfunction fn{};
+  // CUCHK(c10::cuda::DriverAPI::get()->cuModuleLoadDataEx_(&mod, cubinOut, 0, nullptr, nullptr));
+  // CUCHK(c10::cuda::DriverAPI::get()->cuModuleGetFunction_(&fn, mod, kernel_name.c_str()));
+
+  // // Destroy link state (module holds its own copy)
+  // CUCHK(c10::cuda::DriverAPI::get()->cuLinkDestroy_(link_state));
+
+  // stash
+  const int id = g_next_id.fetch_add(1, std::memory_order_relaxed);
+  g_key_to_id.emplace(key, id);
+  g_id_to_kernel.emplace(id, NvrtcKernel{mod, fn, arch, kernel_name});
+  return id;
+}
+
+// For host-side shared memory sizing convenience:
+static int _cuda_sizeof_kernel_node_update() {
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12040)
+  return static_cast<int>(sizeof(cudaGraphKernelNodeUpdate));
+#else
+  return 0; // not supported on this toolkit
+#endif
+}
+// --- public: launch built kernel ---
+// Kernel signature expected by your codegen:
+// extern "C" __global__ void <name>(
+//    const cudaGraphDeviceNode_t* dev_nodes,
+//    unsigned long long* values_buf,
+//    int* status_out);
+static void _nvrtc_launch_kernel(
+    int handle,
+    uintptr_t stream_addr,
+    int grid_x, int grid_y, int grid_z,
+    int block_x, int block_y, int block_z,
+    size_t num_updates,
+    uintptr_t dev_nodes_ptr,
+    uintptr_t values_buf_ptr,
+    uintptr_t status_out_ptr) {
+
+  NvrtcKernel entry{};
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    auto it = g_id_to_kernel.find(handle);
+    TORCH_CHECK(it != g_id_to_kernel.end(), "_nvrtc_launch_kernel: invalid handle");
+    entry = it->second;
+  }
+
+  CUfunction fn = entry.fn;
+  CUstream cu   = reinterpret_cast<CUstream>(stream_addr);
+
+  void* args[] = {
+    (void*)&dev_nodes_ptr,
+    (void*)&values_buf_ptr,
+    (void*)&status_out_ptr,
+  };
+
+  const unsigned shared_bytes =
+        static_cast<unsigned>(num_updates * _cuda_sizeof_kernel_node_update());
+
+  CUCHK(c10::cuda::DriverAPI::get()->cuLaunchKernel_(
+      fn,
+      static_cast<unsigned>(grid_x),
+      static_cast<unsigned>(grid_y),
+      static_cast<unsigned>(grid_z),
+      static_cast<unsigned>(block_x),
+      static_cast<unsigned>(block_y),
+      static_cast<unsigned>(block_z),
+      static_cast<unsigned>(shared_bytes),
+      cu,
+      args,
+      nullptr));
+}
+
+// --- optional: free a handle explicitly (modules are ref-counted by process) ---
+static void _nvrtc_release_kernel(int handle) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_id_to_kernel.find(handle);
+  if (it != g_id_to_kernel.end()) {
+    if (it->second.mod) {
+      // Best-effort unload
+      c10::cuda::DriverAPI::get()->cuModuleUnload_(it->second.mod);
+    }
+    g_id_to_kernel.erase(it);
+    // Note: we intentionally do not erase g_key_to_id: future build will recompile.
+  }
+}
+
+// ---------------- pybind registration ----------------
+static void init_graph_nvrtc_bindings(py::module& m) {
+  m.def("_nvrtc_build_kernel",
+        &_nvrtc_build_kernel,
+        py::arg("src"),
+        py::arg("kernel_name") = std::string("apply_param_updates_kernel"),
+        py::arg("extra_options") = std::vector<std::string>{},
+        py::call_guard<py::gil_scoped_release>());
+
+  m.def("_nvrtc_launch_kernel",
+        &_nvrtc_launch_kernel,
+        py::arg("handle"),
+        py::arg("stream_addr"),
+        py::arg("grid_x"), py::arg("grid_y"), py::arg("grid_z"),
+        py::arg("block_x"), py::arg("block_y"), py::arg("block_z"),
+        py::arg("num_updates"),
+        py::arg("dev_nodes_ptr"),
+        py::arg("values_buf_ptr"),
+        py::arg("status_out_ptr"),
+        py::call_guard<py::gil_scoped_release>());
+
+  m.def("_nvrtc_release_kernel",
+        &_nvrtc_release_kernel,
+        py::arg("handle"),
+        py::call_guard<py::gil_scoped_release>());
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1314,6 +1674,145 @@ static void registerCudaPluggableAllocator(PyObject* module) {
 
         addStorageDeleterFns(storages_to_add_deleters_to, delta);
       });
+    m.def(
+    "_copy_dataptr_to_indirection_args",
+    [](
+        py::list& srcs,
+        const std::vector<int>& non_static_indirection_args_indices,
+        const std::vector<int>& non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views,
+        const std::vector<int>& non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views_offsets,
+        at::Tensor& flat_ptr_tensor,
+        at::Tensor& dataptr,  // Pass dataptr as an input tensor
+        // const std::vector<int>& dataptr_indices,
+        int static_indirection_args_count,
+        uint64_t cuda_stream_ptr
+    ) {
+        // THe following three TORCH_CHECKs are in the critical path. Assuming that the 
+        // contract is followed, we ignore the checks.
+        
+        // Validate the flat_ptr_tensor dtype as int64
+        // TORCH_CHECK(flat_ptr_tensor.dtype() == at::kLong, "flat_ptr_tensor must be of dtype int64");
+        // // Ensure that dataptr is of type int64 and has the correct size
+        // TORCH_CHECK(dataptr.dtype() == at::kLong, "dataptr must be of dtype int64");
+        // TORCH_CHECK(dataptr.sizes()[0] == indirection_args_indices.size(), "dataptr must have the same size as indirection_args_indices");
+        size_t non_static_indirection_args_indices_size = non_static_indirection_args_indices.size();
+        size_t non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views_size = 
+                      non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views.size();
+        
+        // Get the raw data pointer to dataptr tensor
+        int64_t* dataptr_ptr = (int64_t*) dataptr.data_ptr();
+
+        // Iterate directly over indirection_args_indices and get the data pointer from srcs or dsts
+        for (size_t i = 0; i < non_static_indirection_args_indices_size; ++i) {
+            size_t idx = non_static_indirection_args_indices[i];
+            int64_t data_ptr_value;
+
+            // Get data pointer from srcs
+            data_ptr_value = reinterpret_cast<int64_t>(srcs[idx].cast<at::Tensor>().data_ptr());
+            // Write directly to the dataptr tensor using the raw pointer
+            dataptr_ptr[static_indirection_args_count + i] = data_ptr_value;
+        }
+        
+        for (size_t i = 0; i < non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views_size; ++i) {
+            size_t idx = non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views[i];
+            int64_t data_ptr_value;
+
+            // Get data pointer from srcs
+            data_ptr_value = reinterpret_cast<int64_t>(srcs[idx].cast<at::Tensor>().data_ptr())
+                             + non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views_offsets[i];
+            // Write directly to the dataptr tensor using the raw pointer
+            dataptr_ptr[static_indirection_args_count + non_static_indirection_args_indices_size + i] = data_ptr_value;
+        }
+        // Copy data pointers to flat_ptr_tensor
+        // flat_ptr_tensor.copy_(dataptr, /*non_blocking=*/true);
+        // The above copy_() has overhead. So directly using the cudaMemcpy() function to copy the data. 
+        int64_t* flat_ptr_tensor_ptr = (int64_t*) flat_ptr_tensor.data_ptr();
+
+        cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(cuda_stream_ptr);
+        size_t size = (non_static_indirection_args_indices_size + 
+          non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views_size) * sizeof(int64_t);
+        // copying only the non static locations
+        cudaMemcpyAsync(
+            flat_ptr_tensor_ptr + static_indirection_args_count,
+            dataptr_ptr + static_indirection_args_count,
+            size,
+            cudaMemcpyHostToDevice, cuda_stream);
+    });
+
+    
+// AVX IMPLEMENTATION
+// m.def(
+//     "_copy_dataptr_to_indirection_args",
+//     [](
+//         py::list& dsts,
+//         py::list& srcs,
+//         const std::vector<int>& cudagraph_managed_indirection_args_indices,
+//         const std::vector<int>& non_cudagraph_managed_indirection_args_indices,
+//         at::Tensor& flat_ptr_tensor,
+//         at::Tensor& dataptr  // Pass dataptr as an input tensor
+//     ) {
+//         // Get the raw data pointer to dataptr tensor
+//         int64_t* dataptr_ptr = (int64_t*)dataptr.data_ptr();
+//         size_t non_cudagraph_size = non_cudagraph_managed_indirection_args_indices.size();
+//         size_t cudagraph_size = cudagraph_managed_indirection_args_indices.size();
+
+//         // Start timer for AVX region
+//         auto start_avx = std::chrono::high_resolution_clock::now();
+
+//         // AVX processing for non-cudagraph managed indices
+//         size_t i = 0;
+//         for (; i + 4 <= non_cudagraph_size; i += 4) {
+//             // Load the data pointers for four tensors at once
+//             __m256i data_ptrs = _mm256_setr_epi64x(
+//                 reinterpret_cast<int64_t>(srcs[non_cudagraph_managed_indirection_args_indices[i]].cast<at::Tensor>().data_ptr()),
+//                 reinterpret_cast<int64_t>(srcs[non_cudagraph_managed_indirection_args_indices[i + 1]].cast<at::Tensor>().data_ptr()),
+//                 reinterpret_cast<int64_t>(srcs[non_cudagraph_managed_indirection_args_indices[i + 2]].cast<at::Tensor>().data_ptr()),
+//                 reinterpret_cast<int64_t>(srcs[non_cudagraph_managed_indirection_args_indices[i + 3]].cast<at::Tensor>().data_ptr())
+//             );
+            
+//             // Store these four data pointers into the destination dataptr_ptr
+//             _mm256_storeu_si256((__m256i*)&dataptr_ptr[i], data_ptrs);
+//         }
+
+//         // Process the remaining elements in the non-cudagraph managed indices (if not divisible by 4)
+//         for (; i < non_cudagraph_size; ++i) {
+//             size_t idx = non_cudagraph_managed_indirection_args_indices[i];
+//             dataptr_ptr[i] = reinterpret_cast<int64_t>(srcs[idx].cast<at::Tensor>().data_ptr());
+//         }
+
+//         // AVX processing for cudagraph managed indices
+//         size_t j = 0;
+//         for (; j + 4 <= cudagraph_size; j += 4) {
+//             // Load the data pointers for four tensors at once
+//             __m256i data_ptrs = _mm256_setr_epi64x(
+//                 reinterpret_cast<int64_t>(dsts[cudagraph_managed_indirection_args_indices[j]].cast<at::Tensor>().data_ptr()),
+//                 reinterpret_cast<int64_t>(dsts[cudagraph_managed_indirection_args_indices[j + 1]].cast<at::Tensor>().data_ptr()),
+//                 reinterpret_cast<int64_t>(dsts[cudagraph_managed_indirection_args_indices[j + 2]].cast<at::Tensor>().data_ptr()),
+//                 reinterpret_cast<int64_t>(dsts[cudagraph_managed_indirection_args_indices[j + 3]].cast<at::Tensor>().data_ptr())
+//             );
+            
+//             // Store these four data pointers into the destination dataptr_ptr
+//             _mm256_storeu_si256((__m256i*)&dataptr_ptr[j + non_cudagraph_size], data_ptrs);
+//         }
+
+//         // Process the remaining elements in the cudagraph managed indices (if not divisible by 4)
+//         for (; j < cudagraph_size; ++j) {
+//             size_t idx = cudagraph_managed_indirection_args_indices[j];
+//             dataptr_ptr[j + non_cudagraph_size] = reinterpret_cast<int64_t>(dsts[idx].cast<at::Tensor>().data_ptr());
+//         }
+
+//         // Stop timer for AVX region
+//         auto end_avx = std::chrono::high_resolution_clock::now();
+//         std::chrono::duration<double, std::micro> avx_duration = end_avx - start_avx;
+//         std::cout << "AVX region took " << avx_duration.count() << " microseconds.\n";
+
+//         // Copy data pointers to flat_ptr_tensor using cudaMemcpy
+//         int64_t* flat_ptr_tensor_ptr = (int64_t*)flat_ptr_tensor.data_ptr();
+//         size_t size = (cudagraph_size + non_cudagraph_size) * sizeof(int64_t);
+//         cudaMemcpy(flat_ptr_tensor_ptr, dataptr_ptr, size, cudaMemcpyHostToDevice);
+//     });
+
+
 }
 
 static void bindGetDeviceProperties(PyObject* module) {
@@ -1605,6 +2104,9 @@ void initModule(PyObject* module) {
 #endif
   registerCudaDeviceProperties(module);
   registerCudaPluggableAllocator(module);
+  auto m = py::handle(module).cast<py::module>();
+  init_graph_apply_updates_bindings(m);
+  init_graph_nvrtc_bindings(m);
 }
 
 } // namespace torch::cuda

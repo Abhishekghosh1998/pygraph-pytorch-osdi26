@@ -181,6 +181,20 @@ class NNModuleVariable(VariableTracker):
             source = None
 
         base = tx.output.get_submodule(self.module_key)
+        ################################################added by me##################################
+        # print(f"tx.output = {tx.output}, {hex(id(tx.output))}")
+        # print(f"From var_gettattr: {base = }, {hex(id(base))}")
+        # print(f"From var_gettattr: {base.__dict__ = }")
+        # print(f"From var_gettattr: {self.module_key = }")
+        # print(f"From var_gettattr: {name = }")
+
+        from torch._inductor.virtualized import V
+        if V.original_module is None:
+            V.original_module = []
+        if base not in V.original_module:
+            V.original_module.append(base)
+        # print(f"{base=}, {hex(id(base))=}, {len(V.original_module)=}")
+        #############################################################################################
         base_dict = object.__getattribute__(base, "__dict__")
         object_member = True
         all_class_attribute_names = set()

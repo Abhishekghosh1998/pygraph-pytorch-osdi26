@@ -27,6 +27,7 @@ import sympy
 
 import torch
 from torch._dynamo.utils import dynamo_timed
+import torch._inductor.config
 from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
 from torch.utils._triton import has_triton
 
@@ -1482,7 +1483,22 @@ class Scheduler:
             )
 
         unbacked_symbol_to_origin_node = {}
+        
+        if torch._inductor.config.triton.indirection:
+            self.inputs_to_aten_convolution_backward_default = list()
+            for node in self.nodes:
+                if (isinstance(node.node,torch._inductor.ir.FallbackKernel)):
+                    # print(f"node.node is a FallbackKernel")
+                    node_op_overload = node.node.op_overload
+                    if (str(node_op_overload) == 'aten.convolution_backward.default'):
+                        # print(f"node.node.op_overload is aten.convolution_backward.default")
+                        node_inputs = node.node.inputs
+                        for input in node_inputs:
+                            if (isinstance(input,torch._inductor.ir.InputBuffer)):
+                                # print(f"{input.name=}")
+                                self.inputs_to_aten_convolution_backward_default.append(input.name)
 
+        
         for node in self.nodes:
             log.debug("scheduling %s", node.node)
 

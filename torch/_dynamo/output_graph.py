@@ -1333,6 +1333,14 @@ class OutputGraph:
         gm._param_name_to_source = self.param_name_to_source  # type: ignore[assignment]
         gm._source_to_user_stacks = self.source_to_user_stacks  # type: ignore[assignment]
 
+        ################################################added by me ################################################
+        from torch._dynamo.exc import RestartAnalysis
+
+        # print(f"From call_user_compiler, self id = {self}")
+        # module = self.get_submodule('self')
+        # print(f"From call_user_compiler, {module = }, {hex(id(module))}")
+        ################################################added by me ################################################
+ 
         try:
             name = (
                 self.compiler_fn.__name__
@@ -1361,6 +1369,12 @@ class OutputGraph:
             # The backend compiler has requested that we skip the frame, instead of
             # aborting execution.
             raise e
+        ##################################################added by me############################################
+        # so that the Restart thing raised in the compile_fx does not get caught as a backend failure
+        # and is propaged to the place where Dynamo Restart happens.
+        except RestartAnalysis as e:
+            raise e
+        #########################################################################################################
         except Exception as e:
             raise BackendCompilerFailed(self.compiler_fn, e).with_traceback(
                 e.__traceback__
@@ -1383,6 +1397,11 @@ class OutputGraph:
         result = []
         for arg in self.graphargs:
             result.append(arg.example)
+        # self.push_stuffs_onto_gpu()
+        # #################################added by me#################################
+        # # move each element in result to the GPU
+        # result = [x.to("cuda") for x in result]
+        # #############################################################################
         return result
 
     def remove_unused_graphargs(self) -> None:

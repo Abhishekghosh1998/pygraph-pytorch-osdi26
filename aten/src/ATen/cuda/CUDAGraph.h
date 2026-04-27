@@ -6,6 +6,11 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/flat_hash_map.h>
 
+//////////////////////////////////////////////////////////////////////////////
+#include <string>
+#include <vector>
+//////////////////////////////////////////////////////////////////////////////
+
 namespace at {
 
 struct Generator;
@@ -17,6 +22,29 @@ namespace cuda {
 // Standalone way to get a unique mempool id usable as a pool=... argument
 // to CUDAGraph::capture_begin
 TORCH_CUDA_CPP_API MempoolId_t graph_pool_handle();
+
+struct KernelParamSlot {
+  // Each parameter slot as returned by cuFuncGetParamInfo
+  size_t offset = 0;
+  size_t size = 0;
+  std::vector<uint8_t> bytes; // raw bytes from kernelParams
+};
+
+struct KernelNodeInfo {
+  // Basic launch config
+  unsigned int gridDimX = 0, gridDimY = 0, gridDimZ = 0;
+  unsigned int blockDimX = 0, blockDimY = 0, blockDimZ = 0;
+  unsigned int sharedMemBytes = 0;
+
+  // Function identity
+  std::string funcName;     // cuFuncGetName result (mangled)
+  uint64_t funcPtr = 0;     // reinterpret_cast<uint64_t>(CUfunction)
+  uint64_t kernelParamsPtr = 0; // reinterpret_cast<uint64_t>(void**)
+  uint64_t extraPtr = 0;        // reinterpret_cast<uint64_t>(void**)
+
+  // Parameters (slots, offsets, sizes, raw bytes)
+  std::vector<KernelParamSlot> params;
+};
 
 struct TORCH_CUDA_CPP_API CUDAGraph {
   CUDAGraph();
@@ -37,6 +65,26 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   MempoolId_t pool();
   void enable_debug_mode();
   void debug_dump(const std::string& debug_path);
+
+  // Returns the kernel node info cached at capture_end().
+  // Empty if capture failed or if there were no kernel nodes.
+  const std::vector<KernelNodeInfo>& kernel_nodes() const { return cached_kernel_nodes_; }
+
+  // Optional: dump to a path (JSON-ish text) if you want a quick file output.
+  void dump_kernel_nodes_to_file(const std::string& path) const;
+
+  // Opt-in: if true, capture_end() will NOT instantiate (keeps graph_ alive)
+  void set_defer_instantiate(bool enable);
+
+  // Explicit instantiate to graph_exec_ after a deferred capture_end()
+  void instantiate();
+
+  // Mark given node indices device-updatable and return their cudaGraphDeviceNode_t handles (as u64)
+  std::vector<uint64_t> mark_nodes_and_get_devhandles(const std::vector<int>& kernel_node_indices);
+
+  // Sizes for Python-side buffer sizing
+  static size_t sizeof_kernel_node_update();
+  static size_t sizeof_device_node_handle();
 
  protected:
 #if !defined(USE_ROCM) || ROCM_VERSION >= 50300
@@ -89,6 +137,12 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   // not CUDA itself.  We can straightforwardly modify CUDAGraph to support multi-device
   // captures if needed.
   int capture_dev_;
+
+  // cached snapshot taken during capture_end(), before graph_ is destroyed
+  std::vector<KernelNodeInfo> cached_kernel_nodes_;
+
+  bool defer_instantiate_ = false;  // default off
+  bool needs_instantiate_ = false;  // set by capture_end() if defer_instantiate_==true
 };
 
 } // namespace cuda
