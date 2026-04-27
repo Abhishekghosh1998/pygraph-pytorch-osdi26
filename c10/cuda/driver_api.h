@@ -26,8 +26,20 @@
   _(cuMemSetAccess)               \
   _(cuMemUnmap)                   \
   _(cuMemCreate)                  \
-  _(cuGetErrorString)
-
+  _(cuGetErrorString)             \
+  _(cuFuncGetName)                \
+  _(cuFuncGetParamInfo)           \
+  _(cuGraphKernelNodeGetParams)   \
+  _(cuModuleLoadDataEx)        \
+  _(cuModuleGetFunction)        \
+  _(cuLaunchKernel)             \
+  _(cuModuleUnload)       \
+  _(cuLinkCreate)         \
+  _(cuLinkAddData)       \
+  _(cuLinkAddFile)       \
+  _(cuLinkComplete)    \
+  _(cuLinkDestroy)
+  
 #define C10_NVML_DRIVER_API(_)           \
   _(nvmlInit_v2)                         \
   _(nvmlDeviceGetHandleByPciBusId_v2)    \

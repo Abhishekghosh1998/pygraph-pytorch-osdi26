@@ -1338,6 +1338,10 @@ class TritonKernel(Kernel):
         self.code_hash = None
         self.triton_meta: Optional[Dict[str, object]] = None
 
+        if torch._inductor.config.triton.indirection:
+            self.indirection_args: list[str] = None
+            self.indirection_args_indices: list[int] = None
+
     def need_numel_args(self):
         r"""
         Indicate whether we need provide numel as arguments for the generated
@@ -2802,7 +2806,27 @@ class TritonKernel(Kernel):
             if config.benchmark_kernel:
                 code.splice(self.imports_for_benchmark_kernel())
 
-        argdefs, _, signature = self.args.python_argdefs()
+        argdefs, call_args, signature = self.args.python_argdefs()
+        # print(f"{call_args=}")
+        # return the indices of call_args which start with `arg``
+        if torch._inductor.config.triton.indirection:
+            non_static_input_idxs = torch._inductor.config.triton.non_static_input_idxs
+            arg_name_to_index = {arg: i for i, arg in enumerate(V.graph.graph_input_names)}
+
+            self.indirection_args_indices = [i for i, arg in enumerate(call_args)              # sometimes even constants are passed directly as arguments
+                                            if isinstance(arg, str)                            # there `startswith` causes trouble.
+                                            and (not arg.startswith("buf")) # in the training phase, the external are not just arg0_1, .. but just anything like primals and all
+                                                                            # but just not buf0, buf1, ...
+                                            and (not arg.startswith("_tensor_constant")) # if the triton kernel uses certain constants,
+                                                                                        # they do not need indirection
+                                            and arg not in V.graph.scheduler.inputs_to_aten_convolution_backward_default 
+                                            # in the training, certain arguments are passed to both triton kernel and 
+                                            # non triton cudnn kernels. In those cases, we need to disable indirection 
+                                            # for those arguments.
+                                            and arg_name_to_index[arg] in non_static_input_idxs
+                                            ]
+                                            
+            self.indirection_args = [call_args[i] for i in self.indirection_args_indices]
         # maps actual expression to SizeArg if it is in sizevars replacements
         for i, arg in enumerate(signature):
             if isinstance(arg, SizeArg):
@@ -2838,6 +2862,9 @@ class TritonKernel(Kernel):
             "constants": {},
         }
 
+        if torch._inductor.config.triton.indirection:
+            triton_meta["indirection_args_indices"] = self.indirection_args_indices
+        
         inductor_meta = {
             "autotune_hints": set(self.autotune_hints),
             "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
@@ -3556,6 +3583,9 @@ class TritonScheduling(BaseScheduling):
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
 
+        if torch._inductor.config.triton.indirection:
+            V.graph.wrapper_code.indirection_args_list.extend(kernel.indirection_args)
+        
         kernel_name = self.define_kernel(src_code, node_schedule)
         log.debug("Generating kernel code with kernel_name: %s", kernel_name)
         kernel.kernel_name = kernel_name
@@ -3783,6 +3813,9 @@ class TritonScheduling(BaseScheduling):
             kernel_name = self.define_kernel(src_code, [foreach_node])
             self.codegen_comment([foreach_node])
             kernel.call_kernel(V.graph.wrapper_code, kernel_name)
+
+            if torch._inductor.config.triton.indirection:
+                V.graph.wrapper_code.indirection_args_list.extend(kernel.indirection_args)
 
         self.scheduler.free_buffers()
 

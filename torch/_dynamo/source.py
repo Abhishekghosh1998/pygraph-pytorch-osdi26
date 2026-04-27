@@ -6,7 +6,7 @@ from typing import Any, Optional, Union
 from torch._guards import ChainedSource, GuardSource, Source
 
 from . import utils
-from .bytecode_transformation import create_call_function, create_instruction
+from .bytecode_transformation import create_call_function, create_instruction, create_call_method
 from .utils import enum_repr
 
 # It shouldn't be supported to construct an NNModuleVariable inside an FSDP module,
@@ -354,6 +354,15 @@ class GetItemSource(ChainedSource):
     def reconstruct(self, codegen):
         reconstruct_getitem(self, codegen, index_is_slice=self.index_is_slice)
         codegen.append_output(create_instruction("BINARY_SUBSCR"))
+    
+    ############################## added by me ################################
+    def new_reconstruct(self, codegen):
+        reconstruct_getitem(self, codegen, index_is_slice=self.index_is_slice)
+        codegen.append_output(create_instruction("BINARY_SUBSCR"))
+        codegen.append_output(codegen.create_load_method("to"))
+        codegen.append_output(codegen.create_load_const("cuda"))
+        codegen.extend_output(create_call_method(1))
+    ###########################################################################
 
     def guard_source(self):
         return self.base.guard_source()
@@ -531,6 +540,14 @@ class NumpyTensorSource(ChainedSource):
         codegen.load_import_from("torch", "as_tensor")
         self.base.reconstruct(codegen)
         codegen.extend_output(create_call_function(1, True))
+    
+    def new_reconstruct(self, codegen):
+        # print(f"{type(codegen)=}, {codegen=}")
+        codegen.load_import_from("torch", "as_tensor")
+        self.base.reconstruct(codegen)
+        codegen.append_output(codegen.create_load_const('cuda'))
+        codegen.append_output(codegen.create_load_const(('device',)))
+        codegen.extend_output([create_instruction("CALL_FUNCTION_KW", arg=2)])
 
 
 # This is a synthetic source that is associated with the singleton

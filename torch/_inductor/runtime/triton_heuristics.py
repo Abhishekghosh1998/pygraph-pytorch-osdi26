@@ -332,14 +332,25 @@ class CachingAutotuner(KernelInterface):
         compile_meta["cc"] = cc
 
         if ASTSource:
-            compile_args = (
-                ASTSource(
-                    self.fn,
-                    compile_meta["signature"],
-                    compile_meta["constants"],
-                    compile_meta["configs"][0],
-                ),
-            )
+            if torch._inductor.config.triton.indirection:
+                compile_args = (
+                    ASTSource(
+                        self.fn,
+                        compile_meta["signature"],
+                        compile_meta["constants"],
+                        compile_meta["configs"][0],
+                        indirection_args_indices = compile_meta["indirection_args_indices"],
+                    ),
+                )
+            else:
+                compile_args = (
+                    ASTSource(
+                        self.fn,
+                        compile_meta["signature"],
+                        compile_meta["constants"],
+                        compile_meta["configs"][0],
+                    ),
+                )
 
             target = (compile_meta["device_type"], cc)
             options = {

@@ -11,6 +11,12 @@
 #include <thread>
 #include <vector>
 
+////////////////////////////////////////////////////////////////////////////////
+#include <fstream>       // for std::ofstream
+#include <cstring>       // for std::memcpy
+#include <c10/cuda/driver_api.h> // for C10_CUDA_DRIVER_CHECK
+////////////////////////////////////////////////////////////////////////////////
+
 namespace at::cuda {
 
 static bool _cuda_graphs_debug = false;
@@ -176,6 +182,89 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*=0*/, cudaStreamCaptureMode capt
 #endif
 }
 
+// helper to read per-parameter bytes given kernelParams (void**)
+static inline std::vector<uint8_t> read_param_bytes(void** kernelParams, size_t byteCount) {
+  std::vector<uint8_t> out(byteCount);
+  // kernelParams[i] points to host memory containing the argument bytes
+  // We'll memcpy directly from that pointer into our vector.
+  // (Callers pass the right sub-pointer per-arg.)
+  std::memcpy(out.data(), *kernelParams, byteCount);
+  return out;
+}
+
+// Decode CUDA 'extra' array to (buffer_ptr, buffer_size).
+// NOTE: For BUFFER_POINTER, 'val' IS the pointer; for BUFFER_SIZE, 'val' points to size_t.
+static bool decode_extra_buffer(void** extra, const void** out_buf, size_t* out_size) {
+  if (!extra) return false;
+  void** p = extra;
+  const void* buf_ptr = nullptr;
+  size_t buf_size = 0;
+
+  while (*p && *p != CU_LAUNCH_PARAM_END) {
+    void* key = *p++;
+    if (!*p) break; // malformed
+    void* val = *p++;
+
+    if (key == CU_LAUNCH_PARAM_BUFFER_POINTER) {
+      buf_ptr = val; // value IS the pointer
+    } else if (key == CU_LAUNCH_PARAM_BUFFER_SIZE) {
+      buf_size = *reinterpret_cast<size_t*>(val); // value points to size_t
+    }
+  }
+
+  if (buf_ptr && buf_size > 0) {
+    *out_buf = buf_ptr;
+    *out_size = buf_size;
+    return true;
+  }
+  return false;
+}
+
+// Fill KernelNodeInfo.params from a packed parameter buffer using cuFuncGetParamInfo.
+static void fill_params_from_packed_buffer(
+    const CUfunction& func,
+    const unsigned char* buf,
+    size_t buf_size,
+    std::vector<KernelParamSlot>& out_params) {
+
+  size_t idx = 0;
+  for (;; ++idx) {
+    size_t off = 0, sz = 0;
+    CUresult r = CUDA_ERROR_NOT_SUPPORTED;
+
+    // Use the driver shim if available (works with PyTorch's dlopen scheme).
+    if (auto fn = c10::cuda::DriverAPI::get()->cuFuncGetParamInfo_) {
+      r = fn(func, idx, &off, &sz);
+    }
+    if (r != CUDA_SUCCESS) break;
+
+    KernelParamSlot slot;
+    slot.offset = off;
+    slot.size = sz;
+
+    // guard against bad sizes
+    if (off + sz <= buf_size) {
+      slot.bytes.resize(sz);
+      std::memcpy(slot.bytes.data(), buf + off, sz);
+    } else {
+      // Truncate gracefully if reported size exceeds buffer (defensive)
+      size_t avail = (off < buf_size) ? (buf_size - off) : 0;
+      slot.bytes.resize(avail);
+      if (avail) std::memcpy(slot.bytes.data(), buf + off, avail);
+    }
+    out_params.emplace_back(std::move(slot));
+  }
+
+  // If the driver cannot enumerate params (older driver/toolkit), still expose the whole blob.
+  if (idx == 0) {
+    KernelParamSlot slot;
+    slot.offset = 0;
+    slot.size = buf_size;
+    slot.bytes.assign(buf, buf + buf_size);
+    out_params.emplace_back(std::move(slot));
+  }
+}
+
 void CUDAGraph::capture_end() {
 #if !defined(USE_ROCM) || ROCM_VERSION >= 50300
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -189,6 +278,87 @@ void CUDAGraph::capture_end() {
 
   TORCH_CHECK(graph_ != NULL, "Invalid capture.");
   has_graph_ = true;
+
+
+  size_t numCUDAGraphNodes = 0;
+  AT_CUDA_CHECK(cudaGraphGetNodes(graph_, NULL, &numCUDAGraphNodes));
+  if (numCUDAGraphNodes == 0) {
+      TORCH_WARN("The CUDA Graph is empty. This usually means that the graph was ",
+                 "attempted to be captured on wrong device or stream.");
+  }
+
+  // --------- NEW: snapshot kernel nodes before possibly destroying graph_ ----------
+  cached_kernel_nodes_.clear();
+  if (numCUDAGraphNodes > 0) {
+    std::vector<cudaGraphNode_t> nodes(numCUDAGraphNodes);
+    AT_CUDA_CHECK(cudaGraphGetNodes(graph_, nodes.data(), &numCUDAGraphNodes));
+    for (auto n : nodes) {
+      cudaGraphNodeType t;
+      AT_CUDA_CHECK(cudaGraphNodeGetType(n, &t));
+      if (t == cudaGraphNodeTypeKernel) {
+        CUDA_KERNEL_NODE_PARAMS p{};
+        C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuGraphKernelNodeGetParams_(n, &p));
+
+        KernelNodeInfo info;
+        info.gridDimX = p.gridDimX; info.gridDimY = p.gridDimY; info.gridDimZ = p.gridDimZ;
+        info.blockDimX = p.blockDimX; info.blockDimY = p.blockDimY; info.blockDimZ = p.blockDimZ;
+        info.sharedMemBytes = p.sharedMemBytes;
+        info.funcPtr = reinterpret_cast<uint64_t>(p.func);
+        info.kernelParamsPtr = reinterpret_cast<uint64_t>(p.kernelParams);
+        info.extraPtr = reinterpret_cast<uint64_t>(p.extra);
+
+        // func name
+        const char* fname = nullptr;
+        C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuFuncGetName_(&fname, p.func));
+        if (fname) info.funcName = fname;
+
+        // parameter slots via cuFuncGetParamInfo (CUDA 12.2+), guarded by availability
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12020
+        if (p.kernelParams) {
+          for (size_t idx = 0;; ++idx) {
+            size_t off = 0, sz = 0;
+            CUresult r = CUDA_ERROR_NOT_SUPPORTED;
+            if (auto fn = c10::cuda::DriverAPI::get()->cuFuncGetParamInfo_) {
+              r = fn(p.func, idx, &off, &sz);
+            }
+            if (r != CUDA_SUCCESS) break;
+
+            KernelParamSlot slot;
+            slot.offset = off;
+            slot.size = sz;
+
+            void** base = reinterpret_cast<void**>(p.kernelParams);
+            void* arg_ptr = base[idx];
+            slot.bytes.resize(sz);
+            std::memcpy(slot.bytes.data(), arg_ptr, sz);
+
+            info.params.emplace_back(std::move(slot));
+          }
+        }
+        if (!p.kernelParams && p.extra) {
+          const void* packed_ptr = nullptr;
+          size_t packed_size = 0;
+          if (decode_extra_buffer(p.extra, &packed_ptr, &packed_size)) {
+            const auto* u8 = static_cast<const unsigned char*>(packed_ptr);
+            fill_params_from_packed_buffer(p.func, u8, packed_size, info.params);
+          }
+        }
+#else
+        // Older CUDA toolkits don't have cuFuncGetParamInfo. We still return launch config & func identity.
+#endif
+
+        cached_kernel_nodes_.emplace_back(std::move(info));
+      }
+    }
+  }
+  // --------- end NEW ---------
+
+  // --------- NEW: defer branch (opt-in), KEEP graph_, SKIP instantiate/epilogue/destroy ----------
+  if (defer_instantiate_) {
+    needs_instantiate_ = true;
+    return;  // graph_ remains alive; user will call instantiate() later
+  }
+  // --------- end NEW ----------
 
   // In typical graph usage some tensors (e.g. the tensors used for graph IO) are not freed
   // between replays.
@@ -229,13 +399,6 @@ void CUDAGraph::capture_end() {
     wholegraph_increments = generator_state->capture_epilogue();
   }
 
-  size_t numCUDAGraphNodes = 0;
-  AT_CUDA_CHECK(cudaGraphGetNodes(graph_, NULL, &numCUDAGraphNodes));
-  if (numCUDAGraphNodes == 0) {
-      TORCH_WARN("The CUDA Graph is empty. This usually means that the graph was ",
-                 "attempted to be captured on wrong device or stream.");
-  }
-
   // check if debug path is set
   if (!_cuda_graphs_debug) {
     // Now that we've instantiated graph_ into graph_exec_,
@@ -249,6 +412,85 @@ void CUDAGraph::capture_end() {
   TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 or ROCM >= 5.3")
 #endif
 }
+
+void CUDAGraph::instantiate() {
+#if !defined(USE_ROCM) || ROCM_VERSION >= 50300
+  TORCH_CHECK(needs_instantiate_, "instantiate() called without a deferred capture_end().");
+  TORCH_CHECK(has_graph_ && !has_graph_exec_, "Bad state for instantiate().");
+
+#if (defined(CUDA_VERSION) && CUDA_VERSION >= 11040)
+  int version;
+  AT_CUDA_CHECK(cudaDriverGetVersion(&version));
+  if (version < 11040) {
+#endif
+#if (defined(CUDA_VERSION) && CUDA_VERSION >= 12000)
+    AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, 0));
+#else
+    AT_CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, NULL, NULL, 0));
+#endif
+#if (defined(CUDA_VERSION) && CUDA_VERSION >= 11040)
+  } else {
+    AT_CUDA_CHECK(cudaGraphInstantiateWithFlags(&graph_exec_,
+                                                graph_,
+                                                cudaGraphInstantiateFlagAutoFreeOnLaunch));
+  }
+#endif
+
+  has_graph_exec_ = true;
+  needs_instantiate_ = false;
+
+  // Run RNG epilogue here (was in capture_end() in default path)
+  for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
+    wholegraph_increments = generator_state->capture_epilogue();
+  }
+
+  if (!_cuda_graphs_debug) {
+    AT_CUDA_CHECK(cudaGraphDestroy(graph_));
+    has_graph_ = false;
+  } else {
+    TORCH_WARN("DEBUG: TORCH_CUDAGRAPHS_DEBUG_PATH detected. graph_ will not be freed until debug_dump is called.");
+  }
+#else
+  TORCH_CHECK(false, "CUDA graphs may only be used in Pytorch built with CUDA >= 11.0 or ROCM >= 5.3")
+#endif
+}
+
+void CUDAGraph::dump_kernel_nodes_to_file(const std::string& path) const {
+#if !defined(USE_ROCM) || ROCM_VERSION >= 50300
+  std::ofstream os(path);
+  if (!os) {
+    TORCH_WARN("Could not open ", path, " for writing.");
+    return;
+  }
+  os << "{ \"kernel_nodes\": [\n";
+  for (size_t i = 0; i < cached_kernel_nodes_.size(); ++i) {
+    const auto& k = cached_kernel_nodes_[i];
+    os << "  {\"funcName\":\"" << k.funcName << "\","
+       << "\"grid\":[" << k.gridDimX << "," << k.gridDimY << "," << k.gridDimZ << "],"
+       << "\"block\":[" << k.blockDimX << "," << k.blockDimY << "," << k.blockDimZ << "],"
+       << "\"shared\":" << k.sharedMemBytes << ","
+       << "\"funcPtr\":" << k.funcPtr << ","
+       << "\"kernelParamsPtr\":" << k.kernelParamsPtr << ","
+       << "\"extraPtr\":" << k.extraPtr << ","
+       << "\"params\":[";
+    for (size_t j = 0; j < k.params.size(); ++j) {
+      const auto& s = k.params[j];
+      os << "{\"offset\":" << s.offset << ",\"size\":" << s.size << ",\"bytes\":\"";
+      static const char* hex = "0123456789abcdef";
+      for (uint8_t b : s.bytes) { os << hex[b >> 4] << hex[b & 0xF]; }
+      os << "\"}";
+      if (j + 1 < k.params.size()) os << ",";
+    }
+    os << "]}";
+    if (i + 1 < cached_kernel_nodes_.size()) os << ",";
+    os << "\n";
+  }
+  os << "]}\n";
+#else
+  TORCH_WARN("dump_kernel_nodes_to_file not supported on ROCm < 5.3");
+#endif
+}
+
 
 void CUDAGraph::replay() {
 #if !defined(USE_ROCM) || ROCM_VERSION >= 50300
@@ -276,6 +518,12 @@ void CUDAGraph::replay() {
 #else
   TORCH_CHECK(false, "CUDA graphs is not yet supported on ROCM");
 #endif
+}
+
+void CUDAGraph::set_defer_instantiate(bool enable) {
+  TORCH_CHECK(!has_graph_ && !has_graph_exec_,
+              "set_defer_instantiate() must be called before capture begins.");
+  defer_instantiate_ = enable;
 }
 
 void CUDAGraph::enable_debug_mode() {
@@ -352,6 +600,68 @@ TORCH_CHECK(has_graph_exec_,
 #endif
   return mempool_id_;
 }
+
+std::vector<uint64_t>
+CUDAGraph::mark_nodes_and_get_devhandles(const std::vector<int>& kernel_node_indices) {
+#if !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
+  TORCH_CHECK(false,
+      "Device-updatable kernel nodes require CUDA 12.4+ (CUDA_VERSION >= 12040).");
+#else
+  TORCH_CHECK(has_graph_ && !has_graph_exec_,
+              "mark_nodes_and_get_devhandles() requires a captured (uninstantiated) graph.");
+
+  // Enumerate all nodes in the captured graph
+  size_t n = 0;
+  AT_CUDA_CHECK(cudaGraphGetNodes(graph_, /*nodes=*/nullptr, &n));
+  std::vector<cudaGraphNode_t> all_nodes(n);
+  if (n) {
+    AT_CUDA_CHECK(cudaGraphGetNodes(graph_, all_nodes.data(), &n));
+  }
+
+  // Build a compact vector of ONLY kernel nodes, in the same order we expose to Python
+  std::vector<cudaGraphNode_t> kernel_nodes;
+  kernel_nodes.reserve(all_nodes.size());
+  for (auto node : all_nodes) {
+    cudaGraphNodeType t;
+    AT_CUDA_CHECK(cudaGraphNodeGetType(node, &t));
+    if (t == cudaGraphNodeTypeKernel) {
+      kernel_nodes.push_back(node);
+    }
+  }
+
+  // For each requested kernel-node index, mark as device-updatable and fetch dev handle
+  std::vector<uint64_t> out;
+  out.reserve(kernel_node_indices.size());
+
+  for (int kidx : kernel_node_indices) {
+    TORCH_CHECK(0 <= kidx && kidx < static_cast<int>(kernel_nodes.size()),
+                "kernel node index ", kidx, " out of bounds (0..",
+                static_cast<int>(kernel_nodes.size()) - 1, ")");
+
+    auto node = kernel_nodes[kidx];
+
+    // Set attribute: mark as device-updatable.
+    cudaKernelNodeAttrValue attr{};
+    attr.deviceUpdatableKernelNode.deviceUpdatable = 1;
+    attr.deviceUpdatableKernelNode.devNode = 0;
+    AT_CUDA_CHECK(cudaGraphKernelNodeSetAttribute(
+        node, cudaKernelNodeAttributeDeviceUpdatableKernelNode, &attr));
+
+    
+    uint64_t h = 0;
+    static_assert(sizeof(cudaGraphDeviceNode_t) <= sizeof(uint64_t),
+                  "cudaGraphDeviceNode_t larger than uint64_t storage.");
+    std::memcpy(&h, &attr.deviceUpdatableKernelNode.devNode,
+                sizeof(attr.deviceUpdatableKernelNode.devNode));
+    out.push_back(h);
+  }
+
+  return out;
+#endif
+}
+
+size_t CUDAGraph::sizeof_kernel_node_update() { return sizeof(cudaGraphKernelNodeUpdate); }
+size_t CUDAGraph::sizeof_device_node_handle() { return sizeof(cudaGraphDeviceNode_t); }
 
 CUDAGraph::~CUDAGraph() {
   for (auto& [generator_state, wholegraph_increments] :

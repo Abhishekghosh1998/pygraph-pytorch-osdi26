@@ -87,5 +87,55 @@ void THCPGraph_init(PyObject* module) {
           "debug_dump",
           torch::wrap_pybind_function_no_gil(
               &::at::cuda::CUDAGraph::debug_dump),
-          py::arg("debug_path"));
+          py::arg("debug_path"))
+      .def(
+          "kernel_nodes",
+          [](::at::cuda::CUDAGraph& self) {
+            const auto& nodes = self.kernel_nodes();
+            py::list out;
+            for (const auto& k : nodes) {
+              py::dict d;
+              d["func_name"] = k.funcName;
+              d["grid"] = py::make_tuple(k.gridDimX, k.gridDimY, k.gridDimZ);
+              d["block"] = py::make_tuple(k.blockDimX, k.blockDimY, k.blockDimZ);
+              d["shared_mem_bytes"] = k.sharedMemBytes;
+              d["func_ptr"] = py::int_(k.funcPtr);
+              d["kernel_params_ptr"] = py::int_(k.kernelParamsPtr);
+              d["extra_ptr"] = py::int_(k.extraPtr);
+
+              py::list params;
+              for (const auto& s : k.params) {
+                py::dict ps;
+                ps["offset"] = s.offset;
+                ps["size"] = s.size;
+                // Use Python bytes for raw argument content
+                ps["bytes"] = py::bytes(reinterpret_cast<const char*>(s.bytes.data()),
+                                        s.bytes.size());
+                params.append(std::move(ps));
+              }
+              d["params"] = std::move(params);
+              out.append(std::move(d));
+            }
+            return out;
+          })
+      .def(
+          "dump_kernel_nodes",
+          [](::at::cuda::CUDAGraph& self, const std::string& path) {
+            self.dump_kernel_nodes_to_file(path);
+          },
+          py::arg("path"),
+          py::call_guard<py::gil_scoped_release>())
+    .def("set_defer_instantiate",
+       torch::wrap_pybind_function_no_gil(&at::cuda::CUDAGraph::set_defer_instantiate),
+       py::arg("enable"))
+    .def("mark_nodes_and_get_devhandles",
+        [](::at::cuda::CUDAGraph& self, const std::vector<int>& idxs) {
+            return self.mark_nodes_and_get_devhandles(idxs);
+        }, py::arg("kernel_node_indices"))
+    .def("instantiate",
+        torch::wrap_pybind_function_no_gil(&at::cuda::CUDAGraph::instantiate))
+    .def_static("sizeof_kernel_node_update",
+        &at::cuda::CUDAGraph::sizeof_kernel_node_update)
+    .def_static("sizeof_device_node_handle",
+        &at::cuda::CUDAGraph::sizeof_device_node_handle);
 }

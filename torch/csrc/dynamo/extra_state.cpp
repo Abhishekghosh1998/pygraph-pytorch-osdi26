@@ -86,6 +86,12 @@ PyObject* lookup(
     ExtraState* extra_state,
     PyObject* f_locals,
     const PyObject* backend) {
+  
+  // // Print f_locals using PyObject_Print
+  // printf("f_locals content:\n");
+  // PyObject_Print(f_locals, stdout, 0);
+  // printf("\n");
+  
   size_t index = 0;
   CacheEntry* found = nullptr;
   py::handle locals(f_locals);
@@ -97,8 +103,10 @@ PyObject* lookup(
         // TODO(anijain2305) - Clean this up when enable_cpp_guard_manager is
         // True by default
         if (cache_entry.root_mgr != nullptr) {
+          DEBUG_TRACE("Entering the cache_entry.root_mgr != nullptr block. %s", "");
           valid = run_root_guard_manager(cache_entry.root_mgr, f_locals);
         } else {
+          DEBUG_TRACE("Entering the cache_entry.check_fn(locals).cast<bool>() block. %s", "");
           valid = cache_entry.check_fn(locals).cast<bool>();
         }
       } catch (py::error_already_set& e) {

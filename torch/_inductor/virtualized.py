@@ -300,11 +300,18 @@ class _V:
     get_fake_mode: Callable[[], Any] = _fake_mode._get_handler
     set_kernel_handler: Callable[[Any], Any] = _kernel._set_handler
     set_debug_handler: Callable[[Any], Any] = _debug._set_handler
+    get_debug_handler: Callable[[], Any] = _debug._get_handler
     set_interpreter_handler: Callable[[Any], Any] = _interpreter._set_handler
     set_aot_compilation: Callable[[bool], Any] = _aot_compilation._set_handler
     get_aot_compilation: Callable[[], Any] = _aot_compilation._get_handler
     set_current_node: Callable[[Any], Any] = _current_node._set_handler
     get_current_node: Callable[[], Any] = _current_node._get_handler
+
+    ################################added by me#############################
+    corresponding_torch_ir_gm_root_sources = None
+    root_sources = None
+    original_module = None
+    #######################################################################
 
     @property
     def ops(self) -> OpsHandler[Any]:

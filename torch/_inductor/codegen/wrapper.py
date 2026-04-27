@@ -476,6 +476,10 @@ class WrapperCodeGen(CodeGen):
         self._metas: Dict[str, str] = {}
         self.multi_kernel_state = MultiKernelState()
 
+        if torch._inductor.config.triton.indirection:
+            self.indirection_args_list: list[str] = []
+            self.reinterpret_views: list[Dict[str, Any]] = []
+
     def write_constant(self, name: str, hashed: str) -> None:
         self.header.writeline(f"{name} = None  # {hashed}")
 
@@ -484,37 +488,80 @@ class WrapperCodeGen(CodeGen):
         aot_config_comment = ""
         if context is not None and context.aot_graph_name is not None:
             aot_config_comment = f"# AOT ID: {context.aot_graph_name}"
-        self.header.splice(
-            f"""
-                {aot_config_comment}
-                from ctypes import c_void_p, c_long
-                import torch
-                import math
-                import random
-                import os
-                import tempfile
-                from math import inf, nan
-                from torch._inductor.hooks import run_intermediate_hooks
-                from torch._inductor.utils import maybe_profile
-                from torch._inductor.codegen.memory_planning import _align as align
+        if torch._inductor.config.triton.indirection:
+            self.header.splice(
+                f"""
+                    {aot_config_comment}
+                    from ctypes import c_void_p, c_long
+                    import torch
+                    import math
+                    import random
+                    import os
+                    import tempfile
+                    from math import inf, nan
+                    from torch._inductor.hooks import run_intermediate_hooks
+                    from torch._inductor.utils import maybe_profile
+                    from torch._inductor.codegen.memory_planning import _align as align
 
-                from torch import device, empty_strided
-                from {codecache.__name__} import AsyncCompile
-                from torch._inductor.select_algorithm import extern_kernels
-                from torch._inductor.codegen.multi_kernel import MultiKernelCall
+                    from torch import device, empty_strided
+                    from {codecache.__name__} import AsyncCompile
+                    from torch._inductor.select_algorithm import extern_kernels
+                    from torch._inductor.codegen.multi_kernel import MultiKernelCall
 
-                aten = torch.ops.aten
-                inductor_ops = torch.ops.inductor
-                _quantized = torch.ops._quantized
-                assert_size_stride = torch._C._dynamo.guards.assert_size_stride
-                empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
-                empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
-                alloc_from_pool = torch.ops.inductor._alloc_from_pool
-                reinterpret_tensor = torch.ops.inductor._reinterpret_tensor
-                async_compile = AsyncCompile()
+                    aten = torch.ops.aten
+                    inductor_ops = torch.ops.inductor
+                    _quantized = torch.ops._quantized
+                    # Step 1: Store the original assert_size_stride
+                    assert_size_stride0 = torch._C._dynamo.guards.assert_size_stride
 
-            """
-        )
+                    # Step 2: Define the wrapper function
+                    def assert_size_stride(arg, size, stride):
+                        # Step 3: Check if the argument has the 'direct' attribute
+                        if hasattr(arg, 'direct'):
+                            assert_size_stride0(arg.direct, size, stride)
+                        else:
+                            assert_size_stride0(arg, size, stride)
+                    
+                    empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+                    empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+                    alloc_from_pool = torch.ops.inductor._alloc_from_pool
+                    reinterpret_tensor = torch.ops.inductor._reinterpret_tensor
+                    async_compile = AsyncCompile()
+
+                """
+            )
+        else:
+            self.header.splice(
+                f"""
+                    {aot_config_comment}
+                    from ctypes import c_void_p, c_long
+                    import torch
+                    import math
+                    import random
+                    import os
+                    import tempfile
+                    from math import inf, nan
+                    from torch._inductor.hooks import run_intermediate_hooks
+                    from torch._inductor.utils import maybe_profile
+                    from torch._inductor.codegen.memory_planning import _align as align
+
+                    from torch import device, empty_strided
+                    from {codecache.__name__} import AsyncCompile
+                    from torch._inductor.select_algorithm import extern_kernels
+                    from torch._inductor.codegen.multi_kernel import MultiKernelCall
+
+                    aten = torch.ops.aten
+                    inductor_ops = torch.ops.inductor
+                    _quantized = torch.ops._quantized
+                    assert_size_stride = torch._C._dynamo.guards.assert_size_stride
+                    empty_strided_cpu = torch._C._dynamo.guards._empty_strided_cpu
+                    empty_strided_cuda = torch._C._dynamo.guards._empty_strided_cuda
+                    alloc_from_pool = torch.ops.inductor._alloc_from_pool
+                    reinterpret_tensor = torch.ops.inductor._reinterpret_tensor
+                    async_compile = AsyncCompile()
+
+                """
+            )    
 
     @cache_on_self
     def write_triton_header_once(self) -> None:
@@ -783,6 +830,30 @@ class WrapperCodeGen(CodeGen):
             result.splice(self.wrapper_call)
 
         self.generate_before_suffix(result)
+        if torch._inductor.config.triton.indirection:
+            self.suffix.writeline("")
+            self.suffix.writeline(f"call.indirection_args_list = {self.indirection_args_list}")
+            
+            # V.graph.graph_input_names is the list of all the argument names
+            # create an argument name to argument index mapping
+            arg_name_to_index = {arg: i for i, arg in enumerate(V.graph.graph_input_names)}
+            self.suffix.writeline(f"call.arg_name_to_index = {arg_name_to_index}")
+            
+            # collect all the names in output_refs which do not have the "buf" followed by a number 
+            # or None or _tensor_constant followed by a number
+            inputs_directly_passed_as_output = {
+                                                    i: x for i, x in enumerate(output_refs)
+                                                    if not re.search(r"buf\d+|None|_tensor_constant\d+", x)
+                                            }
+            self.suffix.writeline(f"call.inputs_directly_passed_as_output = {inputs_directly_passed_as_output}")
+            reinterpret_views_per_arg_idx :Dict[int, list[Dict[str, Any]]] = {}
+            for i, arg_name in enumerate(V.graph.graph_input_names):
+                reinterpret_views = [
+                    rv for rv in self.reinterpret_views if arg_name == rv["tensor_name"]
+                ]
+                if reinterpret_views:
+                    reinterpret_views_per_arg_idx[i] = reinterpret_views
+            self.suffix.writeline(f"call.reinterpret_views_per_arg_idx = {reinterpret_views_per_arg_idx}")
         result.splice(self.suffix)
 
         self.generate_end(result)
@@ -944,7 +1015,15 @@ class WrapperCodeGen(CodeGen):
         size = self.codegen_shape_tuple(size)
         stride = self.codegen_shape_tuple(stride)
         offset = self.codegen_sizevar(offset)
-        return f"reinterpret_tensor({data.get_name()}, {size}, {stride}, {offset})"
+        output = f"reinterpret_tensor({data.get_name()}, {size}, {stride}, {offset})"
+        if torch._inductor.config.triton.indirection:
+            self.reinterpret_views.append({
+                "tensor_name": data.get_name(),
+                "size": size,
+                "stride": stride,
+                "offset": offset
+            })
+        return output
 
     def codegen_device_copy(self, src, dst):
         self.writeline(f"{dst}.copy_({src})")
