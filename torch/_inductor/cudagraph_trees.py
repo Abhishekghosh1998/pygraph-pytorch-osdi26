@@ -738,6 +738,8 @@ class CUDAGraphNode:
     ):
         assert isinstance(inputs, (list, tuple))
 
+        self._copy_inputs_and_remove_from_src_original = self._copy_inputs_and_remove_from_src
+        self._copy_inputs_and_remove_from_src = self._copy_inputs_and_remove_from_src_verbose
         self.wrapped_function = wrapped_function
         self.id = id
         self.device = device_index
@@ -939,6 +941,30 @@ class CUDAGraphNode:
         # Fails on empty lists
         if dst_tensors:
             torch._foreach_copy_(dst_tensors, src_tensors)
+    
+    def _copy_inputs_and_remove_from_src_verbose(self, dsts, srcs):
+        if not hasattr(self, 'count'):
+            self.count = 0
+        self.count += 1
+        dst_tensors = []
+        src_tensors = []
+        for idx in self.non_static_input_idx:
+            if not isinstance(srcs[idx], torch.Tensor):
+                continue
+            expanded_dims = self.expanded_dims[idx]
+            dst_tensors.append(index_expanded_dims(dsts[idx], expanded_dims))
+            src_tensors.append(index_expanded_dims(srcs[idx], expanded_dims))
+            srcs[idx] = None
+        # Fails on empty lists
+        if dst_tensors:
+            torch._foreach_copy_(dst_tensors, src_tensors)
+        if self.count >= 2:
+            if dst_tensors:
+                src_tensor_nbytes = [t.numel() * t.element_size() for t in src_tensors]
+                print(f"For Function ID={self.wrapped_function.id.id}, GraphID={self.id} copied "
+                     f"{len(dst_tensors)} tensors with sizes {src_tensor_nbytes} bytes")
+            # set the _copy_inputs_and_remove_from_src to the original function
+            self._copy_inputs_and_remove_from_src = self._copy_inputs_and_remove_from_src_original
 
     def check_static_inputs_are_stable(self, new_inputs):
         # avoid checking managed tensor static points since we already checked those in check_invariants
