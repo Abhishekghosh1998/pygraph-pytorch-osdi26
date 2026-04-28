@@ -1916,6 +1916,9 @@ class CUDAGraphNodeIndirect:
         stream: torch.cuda.Stream,
     ):
         assert isinstance(inputs, (list, tuple))
+        self._copy_inputs_and_remove_from_src_original = self._copy_inputs_and_remove_from_src
+        self._copy_inputs_and_remove_from_src = self._copy_inputs_and_remove_from_src_verbose
+        
         self.wrapped_function = wrapped_function
         self.id = id
         self.device = device_index
@@ -2349,7 +2352,33 @@ class CUDAGraphNodeIndirect:
                                                     self.static_indirection_args_count,
                                                     self.current_stream.cuda_stream)
 
+    def _copy_inputs_and_remove_from_src_verbose(self, dsts, srcs):
+        if not hasattr(self, 'count'):
+            self.count = 0
+        self.count += 1
+        
+        # the above python code is replaced by the following C++ code for performance
+        x = self.non_static_indirection_args_indices + self.non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views
+        if x:
+            if self.current_stream is None:
+                self.current_stream = torch.cuda.current_stream()
+            torch._C._copy_dataptr_to_indirection_args( 
+                                                    srcs, 
+                                                    self.non_static_indirection_args_indices, 
+                                                    self.non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views,
+                                                    self.non_static_without_indirection_args_placeholder_idxs_with_reinterpret_views_offsets,
+                                                    self.flat_ptr_tensor,
+                                                    self.dataptr,
+                                                    self.static_indirection_args_count,
+                                                    self.current_stream.cuda_stream)
 
+        if self.count >= 2:
+            if x:
+                dataptr_nbytes = [t.numel() * t.element_size() for t in self.dataptr]
+                print(f"For Function ID={self.wrapped_function.id.id}, GraphID={self.id} copied "
+                     f"{len(self.dataptr)} dataptrs with sizes {dataptr_nbytes} bytes")
+            # set the _copy_inputs_and_remove_from_src to the original function
+            self._copy_inputs_and_remove_from_src = self._copy_inputs_and_remove_from_src_original
     
     def check_static_inputs_are_stable(self, new_inputs):
         # avoid checking managed tensor static points since we already checked those in check_invariants
